@@ -143,7 +143,7 @@ search_methods = {
 ColumnTuple = namedtuple(
     'ColumnDT',
     ['sqla_expr', 'column_name', 'mData', 'search_method',
-     'nulls_order', 'global_search'])
+     'nulls_order', 'global_search', 'search_values'])
 
 
 class InvalidParameter(Exception):
@@ -178,7 +178,7 @@ class ColumnDT(ColumnTuple):
 
     def __new__(cls, sqla_expr, column_name=None, mData=None,
                 search_method='string_contains', nulls_order=None,
-                global_search=True):
+                global_search=True, search_values=None):
         """Set default values for mData and filter.
 
         On creation, sets default None values for mData and string value for
@@ -194,7 +194,7 @@ class ColumnDT(ColumnTuple):
 
         return super(ColumnDT, cls).__new__(
             cls, sqla_expr, column_name, mData, search_method,
-            nulls_order, global_search)
+            nulls_order, global_search, search_values)
 
 
 class DataTables:
@@ -213,7 +213,7 @@ class DataTables:
     """
 
     def __init__(self, request, query, columns,
-                 allow_regex_searches=False):
+                 allow_regex_searches=False, full_count=True):
         """Initialize object and run the query."""
         self.params = dict(request)
         if 'sEcho' in self.params:
@@ -223,6 +223,7 @@ class DataTables:
         self.columns = columns
         self.results = None
         self.allow_regex_searches = allow_regex_searches
+        self.full_count = full_count
 
         # total in the table after filtering
         self.cardinality_filtered = 0
@@ -263,19 +264,25 @@ class DataTables:
         # determine values for yadcf filters
         for i, col in enumerate(self.columns):
             if col.search_method in 'yadcf_range_number_slider':
-                v = query.add_columns(
-                    func.min(col.sqla_expr),
-                    func.max(col.sqla_expr)
-                ).one()
+                if col.search_values:
+                    v = col.search_values
+                else:
+                    v = query.add_columns(
+                        func.min(col.sqla_expr),
+                        func.max(col.sqla_expr)
+                    ).one()
                 self.yadcf_params.append((
                     'yadcf_data_{:d}'.format(i),
                     (math.floor(v[0]), math.ceil(v[1])))
                 )
             if col.search_method in ['yadcf_select', 'yadcf_multi_select',
                                      'yadcf_autocomplete']:
-                filtered = self._query_with_all_filters_except_one(
-                    query=query, exclude=i)
-                v = filtered.add_columns(col.sqla_expr).distinct().all()
+                if col.search_values:
+                    v = col.search_values
+                else:
+                    filtered = self._query_with_all_filters_except_one(
+                        query=query, exclude=i)
+                    v = filtered.add_columns(col.sqla_expr).distinct().all()
                 self.yadcf_params.append(
                     ('yadcf_data_{:d}'.format(i), [r[0] for r in v]))
 
@@ -284,7 +291,9 @@ class DataTables:
         query = self.query
 
         # count before filtering
-        self.cardinality = query.add_columns(self.columns[0].sqla_expr).count()
+        if self.full_count:
+            self.cardinality = query.add_columns(
+                self.columns[0].sqla_expr).count()
 
         self._set_column_filter_expressions()
         self._set_global_filter_expression()
@@ -295,8 +304,9 @@ class DataTables:
         query = query.filter(
             *[e for e in self.filter_expressions if e is not None])
 
-        self.cardinality_filtered = query.add_columns(
-            self.columns[0].sqla_expr).count()
+        if self.full_count:
+            self.cardinality_filtered = query.add_columns(
+                self.columns[0].sqla_expr).count()
 
         # apply sorts
         query = query.order_by(
@@ -305,7 +315,10 @@ class DataTables:
         # add paging options
         length = int(self.params.get('length'))
         if length >= 0:
-            query = query.limit(length)
+            if self.full_count:
+                query = query.limit(length)
+            else:
+                query = query.limit(length*6)
         elif length == -1:
             pass
         else:
@@ -322,6 +335,11 @@ class DataTables:
                         for i, col in enumerate(self.columns)]
         self.results = [{k: v for k, v in zip(
             column_names, row)} for row in query.all()]
+
+        if not self.full_count:
+            self.cardinality = int(self.params.get('start'))+len(self.results)
+            self.cardinality_filtered = int(self.params.get('start'))+len(self.results)
+            self.results = self.results[:length]
 
     def _set_column_filter_expressions(self):
         """Construct the query: filtering.
